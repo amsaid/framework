@@ -8,10 +8,13 @@ use Core\Exceptions\NotFoundException;
 use Core\Application;
 use Core\Request;
 use Core\Response;
+use Core\Debug\Debug;
+use Core\Config\Config;
 
 class ErrorHandler
 {
     private bool $debug;
+    private ?Response $response = null;
 
     public function __construct(bool $debug = false)
     {
@@ -36,19 +39,54 @@ class ErrorHandler
 
     public function handleException(\Throwable $exception): void
     {
-        $statusCode = $this->getStatusCode($exception);
-        $response = Application::getInstance()->getResponse();
-        
-        $response->setStatusCode($statusCode);
-        
-        if ($this->isApiRequest()) {
-            $this->handleApiException($exception, $response);
-        } else {
-            $content = $this->debug ? $this->renderDebugView($exception) : $this->renderBasicErrorPage($exception);
-            $response->setContent($content);
+        try {
+            if ($this->debug) {
+                Debug::addTimelinePoint('Exception Caught: ' . get_class($exception));
+            }
+
+            $statusCode = $this->getStatusCode($exception);
+            
+            // Get or create response object
+            try {
+                $this->response = Application::getInstance()->getResponse();
+            } catch (\Throwable $e) {
+                $this->response = new Response();
+            }
+            
+            $this->response->setStatusCode($statusCode);
+            
+            if ($this->isApiRequest()) {
+                $this->handleApiException($exception);
+            } else {
+                $content = $this->debug ? $this->renderDebugView($exception) : $this->renderBasicErrorPage($exception);
+                $this->response->setContent($content);
+            }
+            
+            // Add debug bar in debug mode for HTML responses
+            if ($this->debug && 
+                $this->response->getHeader('Content-Type') === 'text/html' && 
+                !$this->isApiRequest()) {
+                $content = $this->response->getContent();
+                if (str_contains($content, '</body>')) {
+                    $debugBar = Debug::renderDebugBar();
+                    $content = str_replace('</body>', $debugBar . '</body>', $content);
+                    $this->response->setContent($content);
+                }
+            }
+
+            $this->response->send();
+        } catch (\Throwable $e) {
+            // Fallback error handling if something goes wrong in the error handler
+            http_response_code(500);
+            if ($this->debug) {
+                echo '<h1>Critical Error in Error Handler</h1>';
+                echo '<pre>' . htmlspecialchars($e->getMessage() . "\n" . $e->getTraceAsString()) . '</pre>';
+            } else {
+                echo '<h1>500 Internal Server Error</h1>';
+                echo '<p>An unexpected error occurred. Please try again later.</p>';
+            }
         }
         
-        $response->send();
         exit(1);
     }
 
@@ -60,9 +98,9 @@ class ErrorHandler
         }
     }
 
-    private function handleApiException(\Throwable $exception, Response $response): void
+    private function handleApiException(\Throwable $exception): void
     {
-        $response->setHeader('Content-Type', 'application/json');
+        $this->response->setHeader('Content-Type', 'application/json');
         $data = [
             'error' => [
                 'code' => $this->getStatusCode($exception),
@@ -72,22 +110,27 @@ class ErrorHandler
 
         if ($this->debug) {
             $data['error']['debug'] = [
+                'exception' => get_class($exception),
                 'file' => $exception->getFile(),
                 'line' => $exception->getLine(),
                 'trace' => $exception->getTrace()
             ];
         }
 
-        $response->setContent(json_encode($data, JSON_PRETTY_PRINT));
+        $this->response->setContent(json_encode($data, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE));
     }
 
     private function renderDebugView(\Throwable $exception): string
     {
         $statusCode = $this->getStatusCode($exception);
+        $exceptionClass = get_class($exception);
         $message = $this->getExceptionMessage($exception);
         $file = $exception->getFile();
         $line = $exception->getLine();
         $trace = $exception->getTraceAsString();
+        
+        // Get file preview
+        $filePreview = $this->getFilePreview($file, $line);
         
         return <<<HTML
         <!DOCTYPE html>
@@ -95,25 +138,158 @@ class ErrorHandler
         <head>
             <title>Error {$statusCode}</title>
             <style>
-                body { font-family: Arial, sans-serif; line-height: 1.6; padding: 2rem; }
-                .error { background: #f8d7da; border: 1px solid #f5c6cb; padding: 1rem; border-radius: 4px; }
-                .trace { background: #f8f9fa; padding: 1rem; border-radius: 4px; margin-top: 1rem; }
-                pre { margin: 0; white-space: pre-wrap; }
+                :root {
+                    --bg-color: #f8f9fa;
+                    --text-color: #212529;
+                    --error-bg: #f8d7da;
+                    --error-border: #f5c6cb;
+                    --code-bg: #272822;
+                    --code-text: #f8f8f2;
+                }
+                
+                body {
+                    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+                    line-height: 1.6;
+                    color: var(--text-color);
+                    background: var(--bg-color);
+                    padding: 2rem;
+                    margin: 0;
+                }
+                
+                .container {
+                    max-width: 1200px;
+                    margin: 0 auto;
+                }
+                
+                .error-header {
+                    background: var(--error-bg);
+                    border: 1px solid var(--error-border);
+                    padding: 1.5rem;
+                    border-radius: 4px;
+                    margin-bottom: 2rem;
+                }
+                
+                .error-title {
+                    margin: 0 0 1rem 0;
+                    font-size: 1.5rem;
+                    font-weight: 600;
+                }
+                
+                .error-details {
+                    margin: 0;
+                    font-family: monospace;
+                }
+                
+                .section {
+                    background: white;
+                    border-radius: 4px;
+                    box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+                    margin-bottom: 2rem;
+                    overflow: hidden;
+                }
+                
+                .section-header {
+                    background: #e9ecef;
+                    padding: 1rem 1.5rem;
+                    font-weight: 600;
+                    border-bottom: 1px solid #dee2e6;
+                }
+                
+                .section-content {
+                    padding: 1.5rem;
+                }
+                
+                .code-preview {
+                    background: var(--code-bg);
+                    color: var(--code-text);
+                    padding: 1rem;
+                    border-radius: 4px;
+                    overflow-x: auto;
+                    font-family: 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, Courier, monospace;
+                }
+                
+                .line-number {
+                    color: #75715e;
+                    padding-right: 1rem;
+                    user-select: none;
+                }
+                
+                .error-line {
+                    background: rgba(255,0,0,0.2);
+                }
+                
+                .stack-trace {
+                    font-family: monospace;
+                    white-space: pre-wrap;
+                    word-break: break-all;
+                }
+                
+                @media (max-width: 768px) {
+                    body {
+                        padding: 1rem;
+                    }
+                    
+                    .error-header {
+                        padding: 1rem;
+                    }
+                }
             </style>
         </head>
         <body>
-            <div class="error">
-                <h1>Error {$statusCode}</h1>
-                <p><strong>{$message}</strong></p>
-                <p>in {$file} on line {$line}</p>
-            </div>
-            <div class="trace">
-                <h2>Stack Trace:</h2>
-                <pre>{$trace}</pre>
+            <div class="container">
+                <div class="error-header">
+                    <h1 class="error-title">Error {$statusCode} - {$exceptionClass}</h1>
+                    <p class="error-details">{$message}</p>
+                    <p class="error-details">in {$file} on line {$line}</p>
+                </div>
+                
+                <div class="section">
+                    <div class="section-header">Code Preview</div>
+                    <div class="section-content">
+                        <div class="code-preview">{$filePreview}</div>
+                    </div>
+                </div>
+                
+                <div class="section">
+                    <div class="section-header">Stack Trace</div>
+                    <div class="section-content">
+                        <div class="stack-trace">{$trace}</div>
+                    </div>
+                </div>
             </div>
         </body>
         </html>
         HTML;
+    }
+
+    private function getFilePreview(string $file, int $line, int $context = 10): string
+    {
+        if (!file_exists($file)) {
+            return 'File not found';
+        }
+
+        try {
+            $lines = file($file);
+            $start = max(0, $line - $context - 1);
+            $end = min(count($lines), $line + $context);
+            
+            $output = '';
+            for ($i = $start; $i < $end; $i++) {
+                $currentLine = $i + 1;
+                $lineContent = htmlspecialchars($lines[$i]);
+                $class = $currentLine === $line ? 'error-line' : '';
+                $output .= sprintf(
+                    '<div class="%s"><span class="line-number">%d</span>%s</div>',
+                    $class,
+                    $currentLine,
+                    $lineContent
+                );
+            }
+            
+            return $output;
+        } catch (\Throwable $e) {
+            return 'Could not read file contents';
+        }
     }
 
     private function renderBasicErrorPage(\Throwable $exception): string
@@ -128,9 +304,6 @@ class ErrorHandler
             <meta charset="UTF-8">
             <meta name="viewport" content="width=device-width, initial-scale=1.0">
             <title>Error {$statusCode}</title>
-            <link rel="preconnect" href="https://fonts.googleapis.com">
-            <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-            <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
             <style>
                 * {
                     margin: 0;
@@ -139,7 +312,7 @@ class ErrorHandler
                 }
                 
                 body {
-                    font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+                    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
                     line-height: 1.6;
                     min-height: 100vh;
                     display: flex;
@@ -157,6 +330,16 @@ class ErrorHandler
                     width: 100%;
                     max-width: 600px;
                     text-align: center;
+                    opacity: 0;
+                    transform: translateY(20px);
+                    animation: fadeIn 0.3s ease forwards;
+                }
+                
+                @keyframes fadeIn {
+                    to {
+                        opacity: 1;
+                        transform: translateY(0);
+                    }
                 }
                 
                 .error-code {
@@ -221,20 +404,6 @@ class ErrorHandler
                 <p class="error-message">{$message}</p>
                 <button onclick="window.history.back()" class="back-button">Go Back</button>
             </div>
-            <script>
-                // Add smooth fade-in animation
-                document.addEventListener('DOMContentLoaded', () => {
-                    const container = document.querySelector('.error-container');
-                    container.style.opacity = '0';
-                    container.style.transform = 'translateY(20px)';
-                    container.style.transition = 'all 0.3s ease';
-                    
-                    setTimeout(() => {
-                        container.style.opacity = '1';
-                        container.style.transform = 'translateY(0)';
-                    }, 100);
-                });
-            </script>
         </body>
         </html>
         HTML;
@@ -246,7 +415,11 @@ class ErrorHandler
             return $exception->getCode();
         }
         
-        return 500;
+        if ($exception instanceof NotFoundException) {
+            return 404;
+        }
+        
+        return $exception->getCode() ?: 500;
     }
 
     private function getExceptionMessage(\Throwable $exception): string
@@ -257,19 +430,25 @@ class ErrorHandler
 
         $statusCode = $this->getStatusCode($exception);
         return match ($statusCode) {
-            404 => 'Page not found.',
-            403 => 'Access denied.',
-            default => 'An error occurred. Please try again later.'
+            404 => 'The page you are looking for could not be found.',
+            403 => 'You do not have permission to access this resource.',
+            429 => 'Too many requests. Please try again later.',
+            503 => 'Service temporarily unavailable. Please try again later.',
+            default => Config::get('app.error_message', 'An error occurred. Please try again later.')
         };
     }
 
     private function isApiRequest(): bool
     {
-        $request = Application::getInstance()->getRequest();
-        $path = $request->getPath();
-        $acceptHeader = $request->header('Accept');
-        
-        return str_starts_with($path, '/api/') || 
-               (str_contains($acceptHeader ?? '', 'application/json') && !str_contains($acceptHeader ?? '', 'text/html'));
+        try {
+            $request = Application::getInstance()->getRequest();
+            return $request->isAjax() || 
+                   str_starts_with($request->getPath(), '/api/') || 
+                   $request->header('Accept') === 'application/json';
+        } catch (\Throwable $e) {
+            // Fallback if Request object is not available
+            return isset($_SERVER['HTTP_ACCEPT']) && 
+                   strpos($_SERVER['HTTP_ACCEPT'], 'application/json') !== false;
+        }
     }
 }

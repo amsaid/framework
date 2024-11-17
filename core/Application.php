@@ -9,6 +9,8 @@ use Core\Router;
 use Core\Request;
 use Core\Response;
 use Core\ErrorHandler;
+use Core\Config\Config;
+use RuntimeException;
 
 class Application
 {
@@ -16,41 +18,54 @@ class Application
     private Container $container;
     private Router $router;
     private bool $debugMode = false;
-    private array $config;
     private Request $request;
     private Response $response;
     private ErrorHandler $errorHandler;
 
     private function __construct()
     {
-        // Initialize container
-        $this->container = new Container();
-        $this->registerBaseBindings();
-        
-        // Load environment variables
-        Environment::load();
-        
-        $this->loadConfig();
-        $this->debugMode = Environment::get('APP_DEBUG', false);
-        
-        if ($this->debugMode) {
-            Debug::init();
-        }
-        
-        // Resolve core services
-        $this->errorHandler = $this->container->make(ErrorHandler::class, ['debugMode' => $this->debugMode]);
-        $this->request = $this->container->make(Request::class);
-        $this->response = $this->container->make(Response::class);
-        $this->router = $this->container->make(Router::class);
-        
-        // Set container in router
-        $this->router->setContainer($this->container);
-        
-        // Load routes
-        $this->loadRoutes();
-        
-        if ($this->debugMode) {
-            Debug::addTimelinePoint('Application Initialized');
+        try {
+            // Initialize container
+            $this->container = new Container();
+            $this->registerBaseBindings();
+            
+            // Load environment variables
+            Environment::load();
+            
+            // Load configuration
+            Config::load();
+            
+            // Set debug mode from config or environment
+            $this->debugMode = Config::get('app.debug', Environment::get('APP_DEBUG', false));
+            
+            // Initialize error handler first
+            $this->errorHandler = new ErrorHandler($this->debugMode);
+            
+            if ($this->debugMode) {
+                Debug::init();
+                Debug::addTimelinePoint('Environment Loaded');
+            }
+            
+            // Resolve core services
+            $this->request = $this->container->make(Request::class);
+            $this->response = $this->container->make(Response::class);
+            $this->router = $this->container->make(Router::class);
+            
+            // Set container in router
+            $this->router->setContainer($this->container);
+            
+            // Load routes
+            $this->loadRoutes();
+            
+            if ($this->debugMode) {
+                Debug::addTimelinePoint('Application Initialized');
+            }
+        } catch (\Throwable $e) {
+            if (isset($this->errorHandler)) {
+                $this->errorHandler->handleException($e);
+            } else {
+                throw $e;
+            }
         }
     }
 
@@ -70,25 +85,27 @@ class Application
         $this->container->singleton(Request::class);
         $this->container->singleton(Response::class);
         $this->container->singleton(ErrorHandler::class);
-    }
-
-    private function loadConfig(): void
-    {
-        $configPath = dirname(__DIR__) . '/config/app.php';
-        $this->config = file_exists($configPath) ? require $configPath : [];
         
         if ($this->debugMode) {
-            Debug::addTimelinePoint('Config Loaded');
+            Debug::addTimelinePoint('Base Bindings Registered');
         }
     }
 
     private function loadRoutes(): void
     {
+        $routesPath = Config::get('app.routes_path', dirname(__DIR__) . '/routes');
+        
         // Load web routes
-        $this->router->loadWebRoutes();
+        $webRoutesFile = $routesPath . '/web.php';
+        if (file_exists($webRoutesFile)) {
+            $this->router->loadWebRoutes();
+        }
         
         // Load API routes
-        $this->router->loadApiRoutes();
+        $apiRoutesFile = $routesPath . '/api.php';
+        if (file_exists($apiRoutesFile)) {
+            $this->router->loadApiRoutes();
+        }
         
         if ($this->debugMode) {
             Debug::addTimelinePoint('Routes Loaded');
@@ -101,6 +118,60 @@ class Application
             self::$instance = new self();
         }
         return self::$instance;
+    }
+
+    public function run(): void
+    {
+        try {
+            // Handle the request
+            $response = $this->router->dispatch($this->request);
+            
+            // Convert string responses to Response objects
+            if (is_string($response)) {
+                $this->response->setContent($response);
+                $response = $this->response;
+            } elseif ($response instanceof Response) {
+                $this->response = $response;
+            }
+            
+            // Add debug bar for HTML responses in debug mode
+            if ($this->debugMode) {
+                $contentType = $this->response->getHeader('Content-Type');
+                if ((!$contentType || str_contains($contentType, 'text/html')) && !$this->request->isAjax()) {
+                    $content = $this->response->getContent();
+                    
+                    // If content doesn't have </body>, add it
+                    if (!str_contains($content, '</body>')) {
+                        if (!str_contains($content, '</html>')) {
+                            $content .= "\n</body>\n</html>";
+                        } else {
+                            $content = str_replace('</html>', "</body>\n</html>", $content);
+                        }
+                    }
+                    
+                    // Add debug bar before </body>
+                    $debugBar = Debug::renderDebugBar();
+                    $content = str_replace('</body>', $debugBar . "\n</body>", $content);
+                    
+                    // Ensure we have proper HTML structure
+                    if (!str_contains($content, '<!DOCTYPE html>')) {
+                        $content = "<!DOCTYPE html>\n<html>\n<head>\n<meta charset=\"UTF-8\">\n</head>\n<body>\n" . $content;
+                    }
+                    
+                    $this->response->setContent($content);
+                }
+                Debug::addTimelinePoint('Debug Bar Added');
+            }
+            
+            // Send the response
+            $this->response->send();
+            
+            if ($this->debugMode) {
+                Debug::addTimelinePoint('Response Sent');
+            }
+        } catch (\Throwable $e) {
+            $this->errorHandler->handleException($e);
+        }
     }
 
     public function getContainer(): Container
@@ -123,40 +194,8 @@ class Application
         return $this->response;
     }
 
-    public function getConfig(string $key = null, $default = null)
+    public function isDebugMode(): bool
     {
-        if ($key === null) {
-            return $this->config;
-        }
-
-        return $this->config[$key] ?? $default;
-    }
-
-    public function run(): void
-    {
-        try {
-            $response = $this->router->dispatch($this->request);
-            if (is_string($response)) {
-                $this->response->setContent($response);
-            } elseif (is_array($response) || is_object($response)) {
-                $this->response->setHeader('Content-Type', 'application/json');
-                $this->response->setContent(json_encode($response));
-            } elseif ($response instanceof Response) {
-                $this->response = $response;
-            }
-
-            if ($this->debugMode && $this->response->getHeader('Content-Type') === 'text/html') {
-                $content = $this->response->getContent();
-                if (str_contains($content, '</body>')) {
-                    $debugBar = Debug::renderDebugBar();
-                    $content = str_replace('</body>', $debugBar . '</body>', $content);
-                    $this->response->setContent($content);
-                }
-            }
-
-            $this->response->send();
-        } catch (\Exception $e) {
-            $this->errorHandler->handleException($e);
-        }
+        return $this->debugMode;
     }
 }

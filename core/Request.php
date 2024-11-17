@@ -92,4 +92,114 @@ class Request
 
         return $body;
     }
+
+    /**
+     * Check if the request is an AJAX request
+     */
+    public function isAjax(): bool
+    {
+        return $this->header('X-Requested-With') === 'XMLHttpRequest' ||
+               $this->wantsJson();
+    }
+
+    /**
+     * Check if the request wants a JSON response
+     */
+    public function wantsJson(): bool
+    {
+        $accept = $this->header('Accept');
+        return $accept && (
+            str_contains($accept, '/json') || 
+            str_contains($accept, '+json')
+        );
+    }
+
+    /**
+     * Check if the request expects JSON
+     */
+    public function expectsJson(): bool
+    {
+        return $this->wantsJson() || 
+               $this->isJson();
+    }
+
+    /**
+     * Check if the request has JSON content
+     */
+    public function isJson(): bool
+    {
+        $contentType = $this->header('Content-Type');
+        return $contentType && (
+            str_contains($contentType, '/json') || 
+            str_contains($contentType, '+json')
+        );
+    }
+
+    /**
+     * Get the full URL of the request
+     */
+    public function getUrl(): string
+    {
+        $protocol = isset($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off' ? 'https' : 'http';
+        $host = $_SERVER['HTTP_HOST'] ?? 'localhost';
+        $uri = $_SERVER['REQUEST_URI'] ?? '/';
+        
+        return "{$protocol}://{$host}{$uri}";
+    }
+
+    /**
+     * Get the base URL of the application
+     */
+    public function getBaseUrl(): string
+    {
+        $protocol = isset($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off' ? 'https' : 'http';
+        $host = $_SERVER['HTTP_HOST'] ?? 'localhost';
+        
+        return "{$protocol}://{$host}";
+    }
+
+    /**
+     * Get the IP address of the request
+     */
+    public function getIp(): string
+    {
+        $headers = [
+            'HTTP_CLIENT_IP',
+            'HTTP_X_FORWARDED_FOR',
+            'HTTP_X_FORWARDED',
+            'HTTP_X_CLUSTER_CLIENT_IP',
+            'HTTP_FORWARDED_FOR',
+            'HTTP_FORWARDED',
+            'REMOTE_ADDR'
+        ];
+
+        foreach ($headers as $header) {
+            if (isset($_SERVER[$header])) {
+                foreach (explode(',', $_SERVER[$header]) as $ip) {
+                    $ip = trim($ip);
+                    if (filter_var($ip, FILTER_VALIDATE_IP)) {
+                        return $ip;
+                    }
+                }
+            }
+        }
+
+        return '0.0.0.0';
+    }
+
+    /**
+     * Get the user agent string
+     */
+    public function getUserAgent(): string
+    {
+        return $_SERVER['HTTP_USER_AGENT'] ?? '';
+    }
+
+    /**
+     * Check if the request is secure (HTTPS)
+     */
+    public function isSecure(): bool
+    {
+        return isset($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off';
+    }
 }
