@@ -5,6 +5,10 @@ namespace Core;
 use Core\Exceptions\NotFoundException;
 use Core\Exceptions\HttpException;
 use Closure;
+use Core\Container;
+use RuntimeException;
+use Core\Route;
+use Core\Request;
 
 class Router
 {
@@ -24,16 +28,73 @@ class Router
     private array $groupMiddleware = [];
     private string $name = '';
     private array $whereConditions = [];
+    private ?Container $container = null;
+    private bool $removeTrailingSlash = true;
 
-    public function __construct()
+    public function __construct(Container $container)
     {
-        $this->loadRoutes();
+        $this->container = $container;
         $this->loadMiddlewares();
     }
 
-    private function loadRoutes(): void
+    public function setTrailingSlashBehavior(bool $remove): void
+    {
+        $this->removeTrailingSlash = $remove;
+    }
+
+    private function normalizePath(string $path): string
+    {
+        // Combine prefix with path if exists
+        if ($this->prefix) {
+            $path = trim($this->prefix, '/') . '/' . trim($path, '/');
+        }
+        return '/' . trim($path, '/');
+    }
+
+    private function normalizeUri(string $uri): string
+    {
+        // Remove multiple consecutive slashes
+        $uri = preg_replace('#/+#', '/', $uri);
+        
+        // Handle root path
+        if ($uri === '') {
+            return '/';
+        }
+
+        // Remove trailing slash if configured to do so
+        if ($this->removeTrailingSlash && strlen($uri) > 1) {
+            $uri = rtrim($uri, '/');
+        }
+
+        // Ensure URI starts with /
+        if (!str_starts_with($uri, '/')) {
+            $uri = '/' . $uri;
+        }
+
+        return $uri;
+    }
+
+    public function loadWebRoutes(): void
     {
         $routesPath = dirname(__DIR__) . '/routes/web.php';
+        if (file_exists($routesPath)) {
+            $routes = require $routesPath;
+            if (is_array($routes)) {
+                foreach ($routes as $method => $methodRoutes) {
+                    foreach ($methodRoutes as $path => $handler) {
+                        $this->addRoute($method, $path, $handler);
+                    }
+                }
+            }
+            elseif (is_callable($routes)) {
+                $routes($this);
+            }
+        }
+    }
+
+    public function loadApiRoutes(): void
+    {
+        $routesPath = dirname(__DIR__) . '/routes/api.php';
         if (file_exists($routesPath)) {
             $routes = require $routesPath;
             if (is_array($routes)) {
@@ -63,48 +124,36 @@ class Router
         }
     }
 
-    private function normalizePath(string $path): string
-    {
-        // Combine prefix with path if exists
-        if ($this->prefix) {
-            $path = trim($this->prefix, '/') . '/' . trim($path, '/');
-        }
-        return '/' . trim($path, '/');
-    }
-
     public function addRoute(string $method, string $path, $handler): Route
     {
         $path = $this->normalizePath($path);
-        
+        $method = strtoupper($method);
+
         // Create a new Route instance
         $route = new Route($method, $path, $handler);
         $route->setRouter($this);
-
-        // Apply middleware if any
+        
+        // Apply current middleware group if exists
         if (!empty($this->groupMiddleware)) {
             $route->middleware($this->groupMiddleware);
         }
-
-        // Apply name if set
-        if (!empty($this->name)) {
-            $route->name($this->name);
-            $this->name = ''; // Reset name
+        
+        // Apply where conditions if exists
+        foreach ($this->whereConditions as $param => $pattern) {
+            $route->where($param, $pattern);
         }
-
-        // Apply where conditions if any
-        if (!empty($this->whereConditions)) {
-            foreach ($this->whereConditions as $param => $pattern) {
-                $route->where($param, $pattern);
-            }
-            $this->whereConditions = []; // Reset conditions
+        
+        // Apply name prefix if exists
+        if ($this->name) {
+            $route->name($this->name . '.');
         }
-
+        
         // Store the route
         if (!isset($this->routes[$method])) {
             $this->routes[$method] = [];
         }
         $this->routes[$method][$path] = $route;
-
+        
         return $route;
     }
 
@@ -184,27 +233,38 @@ class Router
         $this->groupMiddleware = $previousMiddleware;
     }
 
-    public function match(string $method, string $path): Route
+    public function match(Request $request): ?Route
     {
-        $method = strtoupper($method);
-        $path = $this->normalizePath($path);
+        $method = $request->getMethod();
+        $uri = $this->normalizeUri($request->getPath());
 
-        // Check for exact match
-        if (isset($this->routes[$method][$path])) {
-            return $this->prepareRoute($this->routes[$method][$path]);
+        // Check for exact match first
+        if (isset($this->routes[$method][$uri])) {
+            return $this->routes[$method][$uri];
         }
 
-        // Check for pattern matches
-        if (isset($this->routes[$method])) {
-            foreach ($this->routes[$method] as $routePath => $route) {
-                if ($this->matchDynamicRoute($routePath, $path, $params)) {
-                    $route->setParameters($params);
-                    return $this->prepareRoute($route);
-                }
+        // If trailing slash behavior is enabled and no exact match was found,
+        // try the alternate version (with/without trailing slash)
+        if ($this->removeTrailingSlash && strlen($uri) > 1) {
+            $alternateUri = str_ends_with($uri, '/') 
+                ? rtrim($uri, '/') 
+                : $uri . '/';
+            
+            if (isset($this->routes[$method][$alternateUri])) {
+                // Redirect to the normalized version
+                header('Location: ' . $uri, true, 301);
+                exit();
             }
         }
 
-        throw new HttpException("Route not found: {$method} {$path}", 404);
+        // Check for pattern matches if no exact match found
+        foreach ($this->routes[$method] ?? [] as $route) {
+            if ($route->matches($method, $uri)) {
+                return $route;
+            }
+        }
+
+        throw new HttpException("Route not found: {$method} {$uri}", 404);
     }
 
     private function prepareRoute(Route $route): Route
@@ -243,5 +303,79 @@ class Router
     public function getMiddleware(string $middleware): string
     {
         return $this->routeMiddlewares[$middleware] ?? $middleware;
+    }
+
+    public function dispatch(Request $request): mixed
+    {
+        if (!$this->container) {
+            throw new RuntimeException("Container not set in Router");
+        }
+
+        $method = strtoupper($request->getMethod());
+        $path = $request->getPath();
+
+        // Check if we have any routes for this method
+        if (!isset($this->routes[$method])) {
+            throw new NotFoundException("No routes found for method {$method}");
+        }
+
+        // Try to match the route
+        foreach ($this->routes[$method] as $route) {
+            if ($route->matches($method, $path)) {
+                return $route->execute($request);
+            }
+        }
+
+        throw new NotFoundException("No route found for {$method} {$path}");
+    }
+
+    /**
+     * Execute the route handler with dependency injection.
+     *
+     * @param string|array|Closure $handler
+     * @param array $parameters
+     * @return mixed
+     */
+    public function executeHandler($handler, array $parameters = [])
+    {
+        if (!$this->container) {
+            throw new RuntimeException("Container not set in Router");
+        }
+
+        if ($handler instanceof Closure) {
+            return $this->container->call($handler, $parameters);
+        }
+
+        // If handler is array [Controller::class, 'method']
+        if (is_array($handler)) {
+            $controller = $handler[0];
+            $method = $handler[1];
+
+            if (is_string($controller)) {
+                $controller = $this->container->make($controller);
+            }
+
+            return $this->container->call([$controller, $method], $parameters);
+        }
+
+        // If handler is string "Controller@method"
+        if (is_string($handler) && str_contains($handler, '@')) {
+            [$controller, $method] = explode('@', $handler);
+            $controller = $this->container->make($controller);
+            return $this->container->call([$controller, $method], $parameters);
+        }
+
+        throw new RuntimeException("Invalid route handler");
+    }
+
+    /**
+     * Set the container instance.
+     *
+     * @param Container $container
+     * @return void
+     */
+    public function setContainer(Container $container): void
+    {
+        $this->container = $container;
     }
 }

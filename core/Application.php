@@ -4,10 +4,16 @@ namespace Core;
 
 use Core\Debug\Debug;
 use Core\Environment;
+use Core\Container;
+use Core\Router;
+use Core\Request;
+use Core\Response;
+use Core\ErrorHandler;
 
 class Application
 {
     private static ?self $instance = null;
+    private Container $container;
     private Router $router;
     private bool $debugMode = false;
     private array $config;
@@ -17,6 +23,10 @@ class Application
 
     private function __construct()
     {
+        // Initialize container
+        $this->container = new Container();
+        $this->registerBaseBindings();
+        
         // Load environment variables
         Environment::load();
         
@@ -27,10 +37,14 @@ class Application
             Debug::init();
         }
         
-        $this->errorHandler = new ErrorHandler($this->debugMode);
-        $this->request = new Request();
-        $this->response = new Response();
-        $this->router = new Router();
+        // Resolve core services
+        $this->errorHandler = $this->container->make(ErrorHandler::class, ['debugMode' => $this->debugMode]);
+        $this->request = $this->container->make(Request::class);
+        $this->response = $this->container->make(Response::class);
+        $this->router = $this->container->make(Router::class);
+        
+        // Set container in router
+        $this->router->setContainer($this->container);
         
         // Load routes
         $this->loadRoutes();
@@ -38,6 +52,24 @@ class Application
         if ($this->debugMode) {
             Debug::addTimelinePoint('Application Initialized');
         }
+    }
+
+    /**
+     * Register the basic bindings into the container.
+     */
+    protected function registerBaseBindings(): void
+    {
+        // Register the container as a singleton
+        $this->container->instance(Container::class, $this->container);
+        
+        // Register the application instance
+        $this->container->instance(self::class, $this);
+        
+        // Register core services as singletons
+        $this->container->singleton(Router::class);
+        $this->container->singleton(Request::class);
+        $this->container->singleton(Response::class);
+        $this->container->singleton(ErrorHandler::class);
     }
 
     private function loadConfig(): void
@@ -52,15 +84,11 @@ class Application
 
     private function loadRoutes(): void
     {
-        $router = $this->router;
-        
         // Load web routes
-        $webRoutes = require dirname(__DIR__) . '/routes/web.php';
-        $webRoutes($router);
+        $this->router->loadWebRoutes();
         
         // Load API routes
-        $apiRoutes = require dirname(__DIR__) . '/routes/api.php';
-        $apiRoutes($router);
+        $this->router->loadApiRoutes();
         
         if ($this->debugMode) {
             Debug::addTimelinePoint('Routes Loaded');
@@ -73,6 +101,11 @@ class Application
             self::$instance = new self();
         }
         return self::$instance;
+    }
+
+    public function getContainer(): Container
+    {
+        return $this->container;
     }
 
     public function getRouter(): Router
@@ -99,48 +132,29 @@ class Application
         return $this->config[$key] ?? $default;
     }
 
-    public function isDebugMode(): bool
-    {
-        return $this->debugMode;
-    }
-
     public function run(): void
     {
         try {
-            if ($this->debugMode) {
-                Debug::addTimelinePoint('Request Processing Start');
-            }
-
-            // Get the matching route for the current request
-            $route = $this->router->match(
-                $this->request->getMethod(),
-                $this->request->getPath()
-            );
-
-            // Execute the route and get the response
-            $response = $route->execute($this->request);
-            
-            if ($this->debugMode) {
-                Debug::addTimelinePoint('Request Processing End');
-                Debug::addMemoryPoint('Peak Memory Usage');
-                
-                // If it's an HTML response, inject the debug bar
-                if (is_string($response) && str_contains($response, '</body>')) {
-                    $debugBar = Debug::renderDebugBar();
-                    $response = str_replace('</body>', $debugBar . '</body>', $response);
-                }
-            }
-
-            // Set response content based on type
+            $response = $this->router->dispatch($this->request);
             if (is_string($response)) {
                 $this->response->setContent($response);
             } elseif (is_array($response) || is_object($response)) {
                 $this->response->setHeader('Content-Type', 'application/json');
                 $this->response->setContent(json_encode($response));
+            } elseif ($response instanceof Response) {
+                $this->response = $response;
+            }
+
+            if ($this->debugMode && $this->response->getHeader('Content-Type') === 'text/html') {
+                $content = $this->response->getContent();
+                if (str_contains($content, '</body>')) {
+                    $debugBar = Debug::renderDebugBar();
+                    $content = str_replace('</body>', $debugBar . '</body>', $content);
+                    $this->response->setContent($content);
+                }
             }
 
             $this->response->send();
-
         } catch (\Exception $e) {
             $this->errorHandler->handleException($e);
         }
